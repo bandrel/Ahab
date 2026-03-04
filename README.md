@@ -64,12 +64,28 @@ ahab --target 10.0.0.1 --port 4243
 ## Development
 
 ```bash
-# Run tests
-pytest -q tests/
+# Install dev dependencies
+uv pip install ".[dev]"
 
-# Lint
-ruff check ahab.py
+# Run unit tests (default, excludes integration)
+uv run pytest
 
-# Format check
-ruff format --check ahab.py
+# Run with coverage report
+uv run pytest --cov --cov-report=term-missing
+
+# Run integration tests (requires Docker daemon on localhost:2375)
+uv run pytest -m integration
+
+# Run integration tests with Docker-in-Docker
+docker compose -f docker-compose.test.yml up -d --wait
+docker compose -f docker-compose.test.yml exec -T dind docker pull alpine:latest
+uv run pytest -m integration -q
+docker compose -f docker-compose.test.yml down -v
+
+# Run all tests (unit + integration)
+uv run pytest -m ""
+
+# Lint and format check
+uv run ruff check ahab.py tests/
+uv run ruff format --check ahab.py tests/
 ```

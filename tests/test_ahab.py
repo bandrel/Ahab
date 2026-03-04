@@ -9,6 +9,7 @@ import requests
 
 from ahab import (
     DockerAPI,
+    _setup_completer,
     categorize_images,
     cmd_containers,
     cmd_deploy,
@@ -27,8 +28,10 @@ from ahab import (
     display_networks,
     display_registry_config,
     format_size,
+    generate_ssh_keypair,
     get_container_networks,
     interactive_shell,
+    main,
     make_tar,
     parse_args,
     setup_ssh,
@@ -325,16 +328,6 @@ class TestDiscoverApi:
 
         discover_api("10.0.0.1", proxy_url="socks5h://127.0.0.1:1080")
         mock_api_cls.assert_called_once_with("http://10.0.0.1:2375", "socks5h://127.0.0.1:1080")
-
-
-# ---------------------------------------------------------------------------
-# Shared fixture
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def mock_api():
-    return MagicMock(spec=DockerAPI)
 
 
 # ---------------------------------------------------------------------------
@@ -830,3 +823,252 @@ class TestInteractiveShell:
         interactive_shell(mock_api, "10.0.0.1")
         out = capsys.readouterr().out
         assert "Exiting" in out
+
+    @patch("builtins.input", side_effect=EOFError)
+    @patch("ahab._setup_completer")
+    def test_eof_exits(self, _completer, _input, mock_api, capsys):
+        interactive_shell(mock_api, "10.0.0.1")
+        out = capsys.readouterr().out
+        assert "Exiting" in out
+
+    @patch("builtins.input", side_effect=KeyboardInterrupt)
+    @patch("ahab._setup_completer")
+    def test_keyboard_interrupt_exits(self, _completer, _input, mock_api, capsys):
+        interactive_shell(mock_api, "10.0.0.1")
+        out = capsys.readouterr().out
+        assert "Exiting" in out
+
+    @patch("builtins.input", side_effect=["", "exit"])
+    @patch("ahab._setup_completer")
+    def test_empty_line_continues(self, _completer, _input, mock_api, capsys):
+        interactive_shell(mock_api, "10.0.0.1")
+        out = capsys.readouterr().out
+        assert "Exiting" in out
+
+    @patch("builtins.input", side_effect=["containers", "exit"])
+    @patch("ahab._setup_completer")
+    def test_command_exception_handled(self, _completer, _input, mock_api, capsys):
+        mock_api.list_containers.side_effect = RuntimeError("test boom")
+        interactive_shell(mock_api, "10.0.0.1")
+        err = capsys.readouterr().err
+        assert "Command error" in err
+
+
+# ---------------------------------------------------------------------------
+# Generate SSH keypair tests
+# ---------------------------------------------------------------------------
+
+
+class TestGenerateSshKeypair:
+    @patch("ahab.subprocess.run")
+    def test_success(self, mock_run, capsys):
+        mock_run.return_value = MagicMock(returncode=0)
+        priv, pub = generate_ssh_keypair()
+        assert priv.endswith("id_rsa")
+        assert pub.endswith("id_rsa.pub")
+        mock_run.assert_called_once()
+        out = capsys.readouterr().out
+        assert "SSH keypair generated" in out
+
+    @patch("ahab.subprocess.run")
+    def test_failure_exits(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stderr="keygen failed")
+        with pytest.raises(SystemExit):
+            generate_ssh_keypair()
+
+
+# ---------------------------------------------------------------------------
+# Main entry point tests
+# ---------------------------------------------------------------------------
+
+
+class TestMain:
+    @patch("ahab.interactive_shell")
+    @patch("ahab.discover_api")
+    def test_success_flow(self, mock_discover, mock_shell, capsys):
+        mock_api = MagicMock()
+        mock_discover.return_value = mock_api
+        main(["--target", "10.0.0.1"])
+        mock_discover.assert_called_once_with("10.0.0.1", None, override_port=None)
+        mock_shell.assert_called_once_with(mock_api, "10.0.0.1")
+
+    @patch("ahab.discover_api", return_value=None)
+    def test_api_none_exits(self, _discover):
+        with pytest.raises(SystemExit):
+            main(["--target", "10.0.0.1"])
+
+    @patch("ahab.interactive_shell")
+    @patch("ahab.discover_api")
+    def test_proxy_passthrough(self, mock_discover, _shell, capsys):
+        mock_discover.return_value = MagicMock()
+        main(["--target", "10.0.0.1", "--proxy", "socks5h://127.0.0.1:1080"])
+        mock_discover.assert_called_once_with("10.0.0.1", "socks5h://127.0.0.1:1080", override_port=None)
+
+
+# ---------------------------------------------------------------------------
+# Setup completer tests
+# ---------------------------------------------------------------------------
+
+
+class TestSetupCompleter:
+    @patch("ahab.readline")
+    def test_sets_completer(self, mock_readline):
+        _setup_completer()
+        mock_readline.set_completer.assert_called_once()
+        mock_readline.parse_and_bind.assert_called_once_with("tab: complete")
+        mock_readline.set_completer_delims.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Additional branch coverage for command handlers
+# ---------------------------------------------------------------------------
+
+
+class TestCmdDeployBranches:
+    def test_invalid_port_warns(self, mock_api, capsys):
+        cmd_deploy(mock_api, ["ubuntu:22.04", "-p", "notaport"])
+        err = capsys.readouterr().err
+        assert "Invalid port" in err
+
+    @patch("ahab.time.sleep")
+    @patch("builtins.input", side_effect=["", "y"])
+    def test_pull_failure_returns(self, _input, _sleep, mock_api, capsys):
+        mock_api.list_images.return_value = []
+        mock_api.pull_image.side_effect = RuntimeError("network error")
+        cmd_deploy(mock_api, ["ubuntu:22.04"])
+        err = capsys.readouterr().err
+        assert "Pull failed" in err
+
+    @patch("builtins.input", return_value="")
+    def test_no_image_interactively_warns(self, _input, mock_api, capsys):
+        cmd_deploy(mock_api, [])
+        err = capsys.readouterr().err
+        assert "No image specified" in err
+
+    @patch("ahab.time.sleep")
+    @patch("builtins.input", side_effect=["", "y"])
+    def test_tag_parsing_without_colon(self, _input, _sleep, mock_api, capsys):
+        mock_api.list_images.return_value = []
+        mock_api.create_container.return_value = "abcdef123456789000"
+        mock_api.inspect_container.return_value = {
+            "State": {"Running": True},
+            "NetworkSettings": {"Networks": {"bridge": {"IPAddress": "172.17.0.2"}}},
+        }
+        cmd_deploy(mock_api, ["myimage"])
+        mock_api.pull_image.assert_called_once_with("myimage", "latest")
+
+
+class TestCmdNetcheckBranches:
+    def test_dns_failure(self, mock_api, capsys):
+        mock_api.inspect_container.return_value = {"State": {"Running": True}}
+        mock_api.exec_run.side_effect = [
+            "DNS_FAIL",
+            "204",
+            "1 packets transmitted, 1 received",
+            "default via 172.17.0.1 dev eth0",
+        ]
+        cmd_netcheck(mock_api, ["abc123"])
+        err = capsys.readouterr().err
+        assert "DNS resolution failed" in err
+
+    def test_http_failure(self, mock_api, capsys):
+        mock_api.inspect_container.return_value = {"State": {"Running": True}}
+        mock_api.exec_run.side_effect = [
+            "nameserver 8.8.8.8\n---\n142.250.80.46 google.com",
+            "HTTP_FAIL",
+            "1 packets transmitted, 1 received",
+            "default via 172.17.0.1 dev eth0",
+        ]
+        cmd_netcheck(mock_api, ["abc123"])
+        err = capsys.readouterr().err
+        assert "HTTP connectivity failed" in err
+
+    def test_ping_failure(self, mock_api, capsys):
+        mock_api.inspect_container.return_value = {"State": {"Running": True}}
+        mock_api.exec_run.side_effect = [
+            "nameserver 8.8.8.8\n---\n142.250.80.46 google.com",
+            "204",
+            "PING_FAIL",
+            "default via 172.17.0.1 dev eth0",
+        ]
+        cmd_netcheck(mock_api, ["abc123"])
+        err = capsys.readouterr().err
+        assert "ICMP ping failed" in err
+
+    def test_empty_route(self, mock_api, capsys):
+        mock_api.inspect_container.return_value = {"State": {"Running": True}}
+        mock_api.exec_run.side_effect = [
+            "nameserver 8.8.8.8\n---\n142.250.80.46 google.com",
+            "204",
+            "1 packets transmitted, 1 received",
+            "",
+        ]
+        cmd_netcheck(mock_api, ["abc123"])
+        err = capsys.readouterr().err
+        assert "Could not retrieve route table" in err
+
+
+class TestCmdRmBranches:
+    @patch("builtins.input", return_value="y")
+    def test_stop_exception_still_removes(self, _input, mock_api, capsys):
+        mock_api.inspect_container.return_value = {
+            "Id": "abcdef123456789000",
+            "Config": {"Image": "ubuntu:22.04"},
+        }
+        mock_api.stop_container.side_effect = RuntimeError("already stopped")
+        cmd_rm(mock_api, ["abcdef123456"])
+        mock_api.remove_container.assert_called_once()
+        out = capsys.readouterr().out
+        assert "removed" in out
+
+    @patch("builtins.input", return_value="y")
+    def test_remove_failure(self, _input, mock_api, capsys):
+        mock_api.inspect_container.return_value = {
+            "Id": "abcdef123456789000",
+            "Config": {"Image": "ubuntu:22.04"},
+        }
+        mock_api.remove_container.side_effect = requests.exceptions.ConnectionError("refused")
+        cmd_rm(mock_api, ["abcdef123456"])
+        err = capsys.readouterr().err
+        assert "Remove failed" in err
+
+
+class TestCmdSshKeysBranches:
+    @patch("os.path.isfile", return_value=False)
+    def test_key_file_not_found(self, _isfile, mock_api, capsys):
+        cmd_ssh_keys(mock_api, ["abc123", "/nonexistent/key.pub"])
+        err = capsys.readouterr().err
+        assert "Key file not found" in err
+
+    def test_http_error_404(self, mock_api, capsys):
+        resp = MagicMock()
+        resp.status_code = 404
+        mock_api.exec_stream.side_effect = requests.exceptions.HTTPError(response=resp)
+
+        with (
+            patch("ahab.generate_ssh_keypair", return_value=("/tmp/key", "/tmp/key.pub")),
+            patch("builtins.open", mock_open(read_data=b"ssh-rsa AAAA...")),
+        ):
+            cmd_ssh_keys(mock_api, ["abc123"])
+        err = capsys.readouterr().err
+        assert "Container not found" in err
+
+
+class TestCmdExecBranches:
+    @patch("os.path.isfile", return_value=True)
+    @patch("builtins.open", mock_open(read_data=b"\x7fELFbinary"))
+    def test_http_error_404(self, _isfile, mock_api, capsys):
+        resp = MagicMock()
+        resp.status_code = 404
+        mock_api.upload_archive.side_effect = requests.exceptions.HTTPError(response=resp)
+        cmd_exec(mock_api, ["abc123", "/opt/implant"])
+        err = capsys.readouterr().err
+        assert "Container not found" in err
+
+    @patch("os.path.isfile", return_value=True)
+    @patch("builtins.open", mock_open(read_data=b"\x7fELFbinary"))
+    def test_http_error_no_response(self, _isfile, mock_api, capsys):
+        mock_api.upload_archive.side_effect = requests.exceptions.ConnectionError("refused")
+        cmd_exec(mock_api, ["abc123", "/opt/implant"])
+        err = capsys.readouterr().err
+        assert "Exec failed" in err

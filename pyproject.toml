@@ -17,6 +17,7 @@ dependencies = [
 proxy = ["PySocks==1.7.1"]
 dev = [
     "pytest==8.3.4",
+    "pytest-cov==6.0.0",
     "ruff==0.9.7",
 ]
 
@@ -32,3 +33,20 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "unit: Pure unit tests (no external dependencies)",
+    "integration: Tests requiring a live Docker daemon",
+]
+addopts = ["-m", "not integration", "--strict-markers"]
+
+[tool.coverage.run]
+source = ["ahab"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.",
+]
