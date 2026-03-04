@@ -1,19 +1,37 @@
-"""Tests for ahab - pure logic and mocked network tests."""
+"""Tests for ahab - pure logic, mocked network, and command handler tests."""
 
 import io
 import tarfile
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
+import requests
 
 from ahab import (
     DockerAPI,
     categorize_images,
+    cmd_containers,
+    cmd_deploy,
+    cmd_exec,
+    cmd_help,
+    cmd_images,
+    cmd_inspect,
+    cmd_netcheck,
+    cmd_rm,
+    cmd_shell,
+    cmd_ssh_keys,
+    deploy_binary,
+    deploy_container,
     discover_api,
+    display_images,
+    display_networks,
+    display_registry_config,
     format_size,
     get_container_networks,
+    interactive_shell,
     make_tar,
     parse_args,
+    setup_ssh,
 )
 
 # ---------------------------------------------------------------------------
@@ -307,3 +325,508 @@ class TestDiscoverApi:
 
         discover_api("10.0.0.1", proxy_url="socks5h://127.0.0.1:1080")
         mock_api_cls.assert_called_once_with("http://10.0.0.1:2375", "socks5h://127.0.0.1:1080")
+
+
+# ---------------------------------------------------------------------------
+# Shared fixture
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mock_api():
+    return MagicMock(spec=DockerAPI)
+
+
+# ---------------------------------------------------------------------------
+# Display function tests
+# ---------------------------------------------------------------------------
+
+
+class TestDisplayImages:
+    def test_prints_all_sections(self, capsys):
+        preferred = [{"RepoTags": ["ubuntu:22.04"], "Id": "sha256:aabbccddee11", "Size": 77000000}]
+        acceptable = [{"RepoTags": ["nginx:latest"], "Id": "sha256:112233445566", "Size": 140000000}]
+        deprioritized = [{"RepoTags": ["alpine:3.18"], "Id": "sha256:ffeeddccbbaa", "Size": 5000000}]
+
+        result = display_images(preferred, acceptable, deprioritized)
+        out = capsys.readouterr().out
+
+        assert "Preferred (Ubuntu/Debian)" in out
+        assert "Other" in out
+        assert "Deprioritized (Alpine/NixOS)" in out
+        assert "ubuntu:22.04" in out
+        assert "nginx:latest" in out
+        assert "alpine:3.18" in out
+        assert len(result) == 3
+
+    def test_empty_inputs_produce_no_output(self, capsys):
+        result = display_images([], [], [])
+        out = capsys.readouterr().out
+        assert out == ""
+        assert result == []
+
+    def test_untagged_images_show_placeholder(self, capsys):
+        imgs = [{"RepoTags": None, "Id": "sha256:aabbccddee11", "Size": 1000}]
+        display_images([], imgs, [])
+        out = capsys.readouterr().out
+        assert "<untagged>" in out
+
+
+class TestDisplayRegistryConfig:
+    def test_prints_mirrors_and_registries(self, mock_api, capsys):
+        mock_api.info.return_value = {
+            "RegistryConfig": {
+                "Mirrors": ["https://mirror.example.com/"],
+                "IndexConfigs": {
+                    "docker.io": {"Official": True, "Secure": True},
+                    "registry.local": {"Official": False, "Secure": False},
+                },
+                "InsecureRegistryCIDRs": ["10.0.0.0/8"],
+            }
+        }
+        display_registry_config(mock_api)
+        out = capsys.readouterr().out
+
+        assert "mirror.example.com" in out
+        assert "docker.io" in out
+        assert "official" in out
+        assert "INSECURE" in out
+        assert "10.0.0.0/8" in out
+
+    def test_handles_empty_config(self, mock_api, capsys):
+        mock_api.info.return_value = {"RegistryConfig": {}}
+        display_registry_config(mock_api)
+        out = capsys.readouterr().out
+        assert "none" in out
+
+    def test_api_error_prints_warning(self, mock_api, capsys):
+        mock_api.info.side_effect = requests.exceptions.ConnectionError("refused")
+        display_registry_config(mock_api)
+        err = capsys.readouterr().err
+        assert "Could not retrieve daemon info" in err
+
+
+class TestDisplayNetworks:
+    def test_prints_network_table(self, mock_api, capsys):
+        mock_api.list_networks.return_value = [
+            {
+                "Name": "bridge",
+                "Driver": "bridge",
+                "Scope": "local",
+                "Id": "abc123def456789012",
+                "IPAM": {"Config": [{"Subnet": "172.17.0.0/16", "Gateway": "172.17.0.1"}]},
+                "Containers": {"c1": {}},
+            }
+        ]
+        display_networks(mock_api)
+        out = capsys.readouterr().out
+
+        assert "bridge" in out
+        assert "172.17.0.0/16" in out
+        assert "gw 172.17.0.1" in out
+
+    def test_handles_empty_network_list(self, mock_api, capsys):
+        mock_api.list_networks.return_value = []
+        display_networks(mock_api)
+        out = capsys.readouterr().out
+        assert "Docker Networks" in out
+
+    def test_api_error_prints_warning(self, mock_api, capsys):
+        mock_api.list_networks.side_effect = requests.exceptions.ConnectionError("refused")
+        display_networks(mock_api)
+        err = capsys.readouterr().err
+        assert "Could not retrieve networks" in err
+
+
+# ---------------------------------------------------------------------------
+# Deployment function tests
+# ---------------------------------------------------------------------------
+
+
+class TestDeployContainer:
+    @patch("ahab.time.sleep")
+    def test_success(self, _sleep, mock_api):
+        mock_api.create_container.return_value = "abcdef123456789000"
+        mock_api.inspect_container.return_value = {"State": {"Running": True}}
+
+        cid, data = deploy_container(mock_api, "ubuntu:22.04")
+
+        assert cid == "abcdef123456789000"
+        assert data["State"]["Running"] is True
+        mock_api.create_container.assert_called_once()
+        config = mock_api.create_container.call_args[0][0]
+        assert config["Cmd"] == ["/bin/sh", "-c", "while true; do sleep 3600; done"]
+        assert "ExposedPorts" not in config
+
+    @patch("ahab.time.sleep")
+    def test_with_host_port(self, _sleep, mock_api):
+        mock_api.create_container.return_value = "abcdef123456789000"
+        mock_api.inspect_container.return_value = {"State": {"Running": True}}
+
+        deploy_container(mock_api, "ubuntu:22.04", host_port=2222)
+
+        config = mock_api.create_container.call_args[0][0]
+        assert "22/tcp" in config["ExposedPorts"]
+        assert config["HostConfig"]["PortBindings"]["22/tcp"] == [{"HostPort": "2222"}]
+
+    @patch("ahab.time.sleep")
+    def test_container_not_running_returns_none(self, _sleep, mock_api):
+        mock_api.create_container.return_value = "abcdef123456789000"
+        mock_api.inspect_container.return_value = {"State": {"Running": False, "Status": "exited"}}
+
+        cid, data = deploy_container(mock_api, "ubuntu:22.04")
+
+        assert cid is None
+        assert data is None
+
+
+class TestSetupSsh:
+    def test_installs_and_configures_ssh(self, mock_api):
+        mock_api.exec_stream.return_value = "done"
+        mock_api.exec_run.return_value = ""
+
+        with patch("builtins.open", mock_open(read_data=b"ssh-rsa AAAA...")):
+            setup_ssh(mock_api, "container123", "/tmp/key.pub")
+
+        mock_api.exec_stream.assert_called_once()
+        assert "openssh-server" in mock_api.exec_stream.call_args[0][1]
+        assert mock_api.exec_run.call_count == 3
+        mock_api.upload_archive.assert_called_once()
+
+    def test_warns_on_apt_errors(self, mock_api, capsys):
+        mock_api.exec_stream.return_value = "E: Unable to locate package"
+        mock_api.exec_run.return_value = ""
+
+        with patch("builtins.open", mock_open(read_data=b"ssh-rsa AAAA...")):
+            setup_ssh(mock_api, "container123", "/tmp/key.pub")
+
+        err = capsys.readouterr().err
+        assert "apt-get reported errors" in err
+
+
+class TestDeployBinary:
+    def test_uploads_and_runs(self, mock_api):
+        mock_api.exec_run.return_value = ""
+
+        with patch("builtins.open", mock_open(read_data=b"\x7fELFbinary")):
+            deploy_binary(mock_api, "container123", "/opt/payloads/implant")
+
+        mock_api.upload_archive.assert_called_once()
+        tar_path = mock_api.upload_archive.call_args[0][1]
+        assert tar_path == "/tmp"
+
+        mock_api.exec_run.assert_called_once()
+        run_cmd = mock_api.exec_run.call_args[0][1]
+        assert "implant" in run_cmd
+        assert mock_api.exec_run.call_args[1]["detach"] is True
+
+
+# ---------------------------------------------------------------------------
+# Command handler tests
+# ---------------------------------------------------------------------------
+
+
+class TestCmdHelp:
+    def test_prints_help_text(self, mock_api, capsys):
+        cmd_help(mock_api, [])
+        out = capsys.readouterr().out
+        assert "containers" in out
+        assert "deploy" in out
+        assert "ssh-keys" in out
+        assert "shell" in out
+
+
+class TestCmdContainers:
+    def test_renders_container_table(self, mock_api, capsys):
+        mock_api.list_containers.return_value = [
+            {
+                "Id": "abcdef123456789000",
+                "Image": "ubuntu:22.04",
+                "Status": "Up 5 hours",
+                "NetworkSettings": {
+                    "Networks": {"bridge": {"IPAddress": "172.17.0.2"}},
+                },
+            }
+        ]
+        cmd_containers(mock_api, [])
+        out = capsys.readouterr().out
+
+        assert "abcdef123456" in out
+        assert "ubuntu:22.04" in out
+        assert "Up 5 hours" in out
+        assert "172.17.0.2" in out
+
+    def test_no_containers(self, mock_api, capsys):
+        mock_api.list_containers.return_value = []
+        cmd_containers(mock_api, [])
+        out = capsys.readouterr().out
+        assert "No containers found" in out
+
+    def test_api_error(self, mock_api, capsys):
+        mock_api.list_containers.side_effect = requests.exceptions.ConnectionError("refused")
+        cmd_containers(mock_api, [])
+        err = capsys.readouterr().err
+        assert "Failed to list containers" in err
+
+
+class TestCmdImages:
+    def test_lists_categorized_images(self, mock_api, capsys):
+        mock_api.list_images.return_value = [
+            {"RepoTags": ["ubuntu:22.04"], "Id": "sha256:aabb", "Size": 77000000},
+        ]
+        cmd_images(mock_api, [])
+        out = capsys.readouterr().out
+        assert "1 image(s)" in out
+        assert "ubuntu:22.04" in out
+
+    def test_empty_image_list(self, mock_api, capsys):
+        mock_api.list_images.return_value = []
+        cmd_images(mock_api, [])
+        out = capsys.readouterr().out
+        assert "0 image(s)" in out
+
+
+class TestCmdInspect:
+    def test_prints_container_details(self, mock_api, capsys):
+        mock_api.inspect_container.return_value = {
+            "Id": "abcdef123456789000",
+            "Name": "/my_container",
+            "Config": {"Image": "ubuntu:22.04"},
+            "State": {"Status": "running", "StartedAt": "2024-01-01T00:00:00Z", "Pid": 12345},
+            "NetworkSettings": {"Networks": {"bridge": {"IPAddress": "172.17.0.2"}}},
+            "Mounts": [{"Source": "/", "Destination": "/host", "RW": True}],
+            "HostConfig": {"Privileged": True},
+        }
+        cmd_inspect(mock_api, ["abcdef123456"])
+        out = capsys.readouterr().out
+
+        assert "abcdef123456" in out
+        assert "my_container" in out
+        assert "ubuntu:22.04" in out
+        assert "running" in out
+        assert "172.17.0.2" in out
+
+    def test_404_prints_not_found(self, mock_api, capsys):
+        resp = MagicMock()
+        resp.status_code = 404
+        mock_api.inspect_container.side_effect = requests.exceptions.HTTPError(response=resp)
+        cmd_inspect(mock_api, ["deadbeef"])
+        err = capsys.readouterr().err
+        assert "Container not found" in err
+
+    def test_missing_args(self, mock_api, capsys):
+        cmd_inspect(mock_api, [])
+        err = capsys.readouterr().err
+        assert "Usage" in err
+
+
+class TestCmdShell:
+    def test_calls_exec_stream(self, mock_api, capsys):
+        mock_api.exec_stream.return_value = "hello world\n"
+        cmd_shell(mock_api, ["abcdef123456", "echo", "hello", "world"])
+        mock_api.exec_stream.assert_called_once_with("abcdef123456", "echo hello world")
+
+    def test_404_handled(self, mock_api, capsys):
+        resp = MagicMock()
+        resp.status_code = 404
+        mock_api.exec_stream.side_effect = requests.exceptions.HTTPError(response=resp)
+        cmd_shell(mock_api, ["deadbeef", "ls"])
+        err = capsys.readouterr().err
+        assert "Container not found" in err
+
+    def test_missing_args(self, mock_api, capsys):
+        cmd_shell(mock_api, ["container_only"])
+        err = capsys.readouterr().err
+        assert "Usage" in err
+
+
+class TestCmdNetcheck:
+    def test_runs_all_checks(self, mock_api, capsys):
+        mock_api.inspect_container.return_value = {"State": {"Running": True}}
+        mock_api.exec_run.side_effect = [
+            "nameserver 8.8.8.8\n---\n142.250.80.46 google.com",
+            "204",
+            "1 packets transmitted, 1 received",
+            "default via 172.17.0.1 dev eth0",
+        ]
+        cmd_netcheck(mock_api, ["abcdef123456"])
+        out = capsys.readouterr().out
+
+        assert "DNS resolution works" in out
+        assert "HTTP connectivity works" in out
+        assert "ICMP ping works" in out
+
+    def test_404_handled(self, mock_api, capsys):
+        resp = MagicMock()
+        resp.status_code = 404
+        mock_api.inspect_container.side_effect = requests.exceptions.HTTPError(response=resp)
+        cmd_netcheck(mock_api, ["deadbeef"])
+        err = capsys.readouterr().err
+        assert "Container not found" in err
+
+
+class TestCmdDeploy:
+    @patch("ahab.time.sleep")
+    def test_image_found_locally(self, _sleep, mock_api, capsys):
+        mock_api.list_images.return_value = [
+            {"RepoTags": ["ubuntu:22.04"], "Id": "sha256:aabb"},
+        ]
+        mock_api.create_container.return_value = "abcdef123456789000"
+        mock_api.inspect_container.return_value = {
+            "State": {"Running": True},
+            "NetworkSettings": {"Networks": {"bridge": {"IPAddress": "172.17.0.2"}}},
+        }
+
+        cmd_deploy(mock_api, ["ubuntu:22.04", "-p", "2222"])
+        out = capsys.readouterr().out
+
+        assert "abcdef123456" in out
+        mock_api.pull_image.assert_not_called()
+
+    @patch("ahab.time.sleep")
+    @patch("builtins.input", side_effect=["", "y"])
+    def test_image_not_found_user_pulls(self, _input, _sleep, mock_api, capsys):
+        mock_api.list_images.return_value = []
+        mock_api.create_container.return_value = "abcdef123456789000"
+        mock_api.inspect_container.return_value = {
+            "State": {"Running": True},
+            "NetworkSettings": {"Networks": {"bridge": {"IPAddress": "172.17.0.2"}}},
+        }
+
+        cmd_deploy(mock_api, ["ubuntu:22.04"])
+        mock_api.pull_image.assert_called_once_with("ubuntu", "22.04")
+
+    @patch("builtins.input", side_effect=["", "n"])
+    def test_image_not_found_user_declines(self, _input, mock_api, capsys):
+        mock_api.list_images.return_value = []
+        cmd_deploy(mock_api, ["ubuntu:22.04"])
+        out = capsys.readouterr().out
+        assert "cancelled" in out.lower()
+
+    @patch("ahab.time.sleep")
+    def test_p_flag_parsed(self, _sleep, mock_api, capsys):
+        mock_api.list_images.return_value = [
+            {"RepoTags": ["ubuntu:22.04"], "Id": "sha256:aabb"},
+        ]
+        mock_api.create_container.return_value = "abcdef123456789000"
+        mock_api.inspect_container.return_value = {
+            "State": {"Running": True},
+            "NetworkSettings": {"Networks": {"bridge": {"IPAddress": "172.17.0.2"}}},
+        }
+
+        cmd_deploy(mock_api, ["-p", "4444", "ubuntu:22.04"])
+        config = mock_api.create_container.call_args[0][0]
+        assert config["HostConfig"]["PortBindings"]["22/tcp"] == [{"HostPort": "4444"}]
+
+
+class TestCmdSshKeys:
+    @patch("ahab.generate_ssh_keypair", return_value=("/tmp/key", "/tmp/key.pub"))
+    @patch("builtins.open", mock_open(read_data=b"ssh-rsa AAAA..."))
+    def test_auto_generates_keypair(self, mock_keygen, mock_api, capsys):
+        mock_api.exec_stream.return_value = "done"
+        mock_api.exec_run.return_value = ""
+        mock_api.inspect_container.return_value = {
+            "NetworkSettings": {"Networks": {"bridge": {"IPAddress": "172.17.0.2"}}},
+            "HostConfig": {"PortBindings": {}},
+        }
+        mock_api.base_url = "http://10.0.0.1:2375"
+
+        cmd_ssh_keys(mock_api, ["abcdef123456"])
+        mock_keygen.assert_called_once()
+
+    @patch("os.path.isfile", return_value=True)
+    @patch("builtins.open", mock_open(read_data=b"ssh-rsa AAAA..."))
+    def test_uses_provided_key_path(self, _isfile, mock_api, capsys):
+        mock_api.exec_stream.return_value = "done"
+        mock_api.exec_run.return_value = ""
+        mock_api.inspect_container.return_value = {
+            "NetworkSettings": {"Networks": {"bridge": {"IPAddress": "172.17.0.2"}}},
+            "HostConfig": {"PortBindings": {}},
+        }
+        mock_api.base_url = "http://10.0.0.1:2375"
+
+        cmd_ssh_keys(mock_api, ["abcdef123456", "/tmp/my_key.pub"])
+        out = capsys.readouterr().out
+        assert "SSH ready" in out
+
+    def test_missing_args(self, mock_api, capsys):
+        cmd_ssh_keys(mock_api, [])
+        err = capsys.readouterr().err
+        assert "Usage" in err
+
+
+class TestCmdExec:
+    @patch("os.path.isfile", return_value=True)
+    @patch("builtins.open", mock_open(read_data=b"\x7fELFbinary"))
+    def test_uploads_and_runs(self, _isfile, mock_api, capsys):
+        mock_api.exec_run.return_value = ""
+        cmd_exec(mock_api, ["abcdef123456", "/opt/implant"])
+        mock_api.upload_archive.assert_called_once()
+        out = capsys.readouterr().out
+        assert "implant" in out
+
+    @patch("os.path.isfile", return_value=False)
+    def test_file_not_found(self, _isfile, mock_api, capsys):
+        cmd_exec(mock_api, ["abcdef123456", "/nonexistent"])
+        err = capsys.readouterr().err
+        assert "Binary not found" in err
+
+    def test_missing_args(self, mock_api, capsys):
+        cmd_exec(mock_api, ["container_only"])
+        err = capsys.readouterr().err
+        assert "Usage" in err
+
+
+class TestCmdRm:
+    @patch("builtins.input", return_value="y")
+    def test_user_confirms_removal(self, _input, mock_api, capsys):
+        mock_api.inspect_container.return_value = {
+            "Id": "abcdef123456789000",
+            "Config": {"Image": "ubuntu:22.04"},
+        }
+        cmd_rm(mock_api, ["abcdef123456"])
+        mock_api.stop_container.assert_called_once()
+        mock_api.remove_container.assert_called_once()
+        out = capsys.readouterr().out
+        assert "removed" in out
+
+    @patch("builtins.input", return_value="n")
+    def test_user_declines_removal(self, _input, mock_api, capsys):
+        mock_api.inspect_container.return_value = {
+            "Id": "abcdef123456789000",
+            "Config": {"Image": "ubuntu:22.04"},
+        }
+        cmd_rm(mock_api, ["abcdef123456"])
+        mock_api.stop_container.assert_not_called()
+        mock_api.remove_container.assert_not_called()
+
+    def test_404_handled(self, mock_api, capsys):
+        resp = MagicMock()
+        resp.status_code = 404
+        mock_api.inspect_container.side_effect = requests.exceptions.HTTPError(response=resp)
+        cmd_rm(mock_api, ["deadbeef"])
+        err = capsys.readouterr().err
+        assert "Container not found" in err
+
+
+class TestInteractiveShell:
+    @patch("builtins.input", side_effect=["help", "exit"])
+    @patch("ahab._setup_completer")
+    def test_dispatches_known_commands(self, _completer, _input, mock_api, capsys):
+        interactive_shell(mock_api, "10.0.0.1")
+        out = capsys.readouterr().out
+        assert "commands:" in out
+
+    @patch("builtins.input", side_effect=["bogus", "quit"])
+    @patch("ahab._setup_completer")
+    def test_unknown_command_prints_warning(self, _completer, _input, mock_api, capsys):
+        interactive_shell(mock_api, "10.0.0.1")
+        err = capsys.readouterr().err
+        assert "Unknown command" in err
+
+    @patch("builtins.input", side_effect=["exit"])
+    @patch("ahab._setup_completer")
+    def test_exit_breaks_loop(self, _completer, _input, mock_api, capsys):
+        interactive_shell(mock_api, "10.0.0.1")
+        out = capsys.readouterr().out
+        assert "Exiting" in out
