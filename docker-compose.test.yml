@@ -2,12 +2,13 @@ services:
   dind:
     image: docker:27-dind
     privileged: true
+    command: ["dockerd", "--host=tcp://0.0.0.0:2375", "--host=unix:///var/run/docker.sock", "--tls=false"]
     environment:
       DOCKER_TLS_CERTDIR: ""
     ports:
       - "2375:2375"
     healthcheck:
-      test: ["CMD", "docker", "info"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:2375/_ping"]
       interval: 5s
       timeout: 3s
       retries: 10
